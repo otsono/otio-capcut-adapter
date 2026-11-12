@@ -9,7 +9,7 @@ description = "OpenTimelineIO adapter that writes CapCut drafts"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = ["OpenTimelineIO>=0.17.0"]
 classifiers = [
     "Programming Language :: Python :: 3",

@@ -12,8 +12,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.9", "3.12", "3.13"]
+        # 3.10 is the oldest Python GitHub's current runners provide.
+        python-version: ["3.10", "3.12", "3.13"]
         otio-version: ["0.17.0", "latest"]
+        exclude:
+          # OpenTimelineIO 0.17.0 has no wheel for 3.13; it would compile from source.
+          - python-version: "3.13"
+            otio-version: "0.17.0"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
