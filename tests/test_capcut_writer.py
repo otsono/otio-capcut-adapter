@@ -35,15 +35,6 @@ def tr(start, duration):
     return otio.opentime.TimeRange(rt(start), rt(duration))
 
 
-@pytest.fixture
-def media(tmp_path):
-    folder = tmp_path / "footage"
-    folder.mkdir()
-    for name, data in (("crowd.mp4", b"crowd"), ("dj.mp4", b"dj"), ("track.mp3", b"music")):
-        (folder / name).write_bytes(data)
-    return folder
-
-
 def clip(name, path, start, duration, available=None):
     ref = otio.schema.ExternalReference(target_url=str(path))
     if available is not None:
@@ -87,6 +78,9 @@ def assert_consistent(draft):
     for track in draft["tracks"]:
         for seg in track["segments"]:
             assert seg["material_id"] in ids
+            if track["type"] == "text":
+                assert all(ref in ids for ref in seg["extra_material_refs"])
+                continue
             assert seg["raw_segment_id"] == track["id"]
             for ref in seg["extra_material_refs"]:
                 assert ref in ids

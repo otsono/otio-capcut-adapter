@@ -1,13 +1,13 @@
 """
-OpenTimelineIO adapter: write a timeline as a CapCut draft.
+OpenTimelineIO adapter for CapCut drafts: write a timeline as a draft, and
+read a draft back as a timeline.
 
-A CapCut draft is a FOLDER, not a file, so this adapter only implements
-``write_to_file`` and ``filepath`` is the draft folder.
+A CapCut draft is a FOLDER, not a file, so ``filepath`` is the draft folder.
+The reader lives in ``otio_capcut_adapter.reader``.
 
 How CapCut decides whether to open a draft is undocumented and changes
-between versions. What is known (largely from the version notes kept by
-capcut-cli, https://github.com/renezander030/capcut-cli) shapes the three
-ways this adapter writes, safest first:
+between versions. What is known shapes the three ways this adapter writes,
+safest first:
 
 1. **Fill a project CapCut created.** Make an empty project in CapCut, quit
    CapCut, and write into that project's folder. The draft keeps the id,
@@ -37,8 +37,13 @@ adapters do; a smaller loss (a marker, a transition written as a cut) is a
 - Clip volume from ``metadata["capcut"]["volume"]`` when present.
 - Media follows ``media_policy``, with the same names and the same strict
   default as OpenTimelineIO's own ``otiod`` bundle adapter.
+- Markers on the timeline itself (its stack) as captions: CapCut text, with
+  the marker's name as the words. Markers on tracks and clips are notes, not
+  captions, and are reported.
 - A cover for CapCut's project list, from a random early frame (ffmpeg).
-- Not yet: markers / captions, transitions, nested stacks, other effects.
+- A new draft written into CapCut's drafts folder is added to CapCut's
+  project index, so it shows in the project list.
+- Not yet: transitions, other effects.
 
 Times in a CapCut draft are integer MICROSECONDS throughout.
 """
@@ -63,7 +68,10 @@ import opentimelineio as otio
 from opentimelineio import url_utils
 from opentimelineio.adapters.file_bundle_utils import MediaReferencePolicy, NotAFileOnDisk
 
+from otio_capcut_adapter import text as captext
 from otio_capcut_adapter.errors import CapCutAdapterError, CapCutWarning
+from otio_capcut_adapter.reader import read_from_file  # noqa: F401  (OTIO looks it up on this module)
+from otio_capcut_adapter.store import register_draft
 
 #: The timeline documents a draft folder can hold, in the order CapCut
 #: versions are known to prefer them as the primary.
@@ -74,7 +82,7 @@ MATERIAL_KEYS = (
     "videos", "audios", "texts", "stickers", "video_effects", "transitions",
     "masks", "chromas", "audio_fades", "audio_effects", "canvases", "speeds",
     "sound_channel_mappings", "vocal_separations", "placeholders",
-    "placeholder_infos", "material_colors", "common_mask",
+    "placeholder_infos", "material_colors", "common_mask", "material_animations",
 )
 
 #: Groups in ``draft_meta_info.json``; type 0 is the imported-media group.
@@ -94,8 +102,8 @@ RENDER_INDEX = {"video": 14000, "audio": 11000}
 
 
 #: Fields CapCut 8.7 writes on every segment, at the values it writes for a
-#: plain, unedited clip. Copied from an app-made draft (capcut-cli's
-#: ``capcut-8.7-windows-active`` fixture) so ours carry the same set.
+#: plain, unedited clip. Copied from a draft the CapCut 8.7 app wrote, so ours
+#: carry the same set.
 SEGMENT_DEFAULTS: Dict[str, Any] = {
     "render_timerange": {"start": 0, "duration": 0}, "desc": "", "state": 0, "is_loop": False,
     "is_tone_modify": False, "intensifies_audio": False, "cartoon": False, "last_nonzero_volume": 1.0,
@@ -155,6 +163,7 @@ def write_to_file(
     cover: Any = None,
     cover_seed: Optional[int] = None,
     ffmpeg: Optional[str] = None,
+    captions: bool = True,
 ) -> Optional[int]:
     """Write ``input_otio`` as the CapCut draft folder ``filepath``.
 
@@ -186,6 +195,10 @@ def write_to_file(
     ``dryrun``
         Check everything and write nothing. Returns the bytes of media that
         would be copied, as ``otiod`` does.
+    ``captions``
+        Write the timeline's own markers (``timeline.tracks.markers``) as
+        CapCut captions, the marker's name being the words (default). With
+        ``False`` they are left out and reported.
     ``width`` / ``height``
         Canvas size. Default: the project's own, else 1920x1080.
     ``name``
@@ -241,6 +254,10 @@ def write_to_file(
         _warn("media_policy is AllMissing: every clip is a placeholder for CapCut to relink.")
     media = _MediaStager(draft_dir, copy_media)
     draft = _build(input_otio, skeleton, canvas, media, media_policy)
+    if captions:
+        _add_captions(input_otio, draft)
+    elif input_otio.tracks.markers:
+        _warn(f"captions=False: {len(input_otio.tracks.markers)} timeline marker(s) left out.")
 
     if dryrun:
         return media.total_bytes()
@@ -290,6 +307,9 @@ def write_to_file(
         if mode == "fill" and path.exists():
             shutil.copy2(path, path.with_name(path.name + ".bak"))
         _write_json(path, doc)
+
+    # Listed in CapCut's project index when the draft sits in CapCut's drafts folder.
+    register_draft(draft_dir, draft, primary_name if mode == "fill" else "draft_content.json")
     return None
 
 
@@ -734,10 +754,50 @@ def _build(
             "segments": segments, "is_default_name": not track.name, "flag": 0,
         })
 
-    if tl.tracks.markers:
-        _warn(f"{len(tl.tracks.markers)} timeline marker(s) are not carried yet.")
     draft["duration"] = end
     return draft
+
+
+#: How long a caption from a marker with no length stays up.
+CAPTION_DEFAULT_S = 2.0
+
+
+def _add_captions(tl: otio.schema.Timeline, draft: Dict[str, Any]) -> None:
+    """The timeline's markers as CapCut text, on as many text tracks as overlaps need.
+
+    A CapCut track holds one thing at a time, so a caption that starts before
+    the one above it ends goes on the next text track down, the way CapCut
+    stacks overlapping text itself.
+    """
+    cues = []
+    for marker in tl.tracks.markers:
+        words = (marker.name or getattr(marker, "comment", "") or "").strip()
+        if not words:
+            _warn("A timeline marker with no name or comment was left out: a caption needs words.")
+            continue
+        start = _us(marker.marked_range.start_time)
+        duration = _us(marker.marked_range.duration) or int(CAPTION_DEFAULT_S * 1_000_000)
+        cues.append((max(0, start), duration, words))
+    if not cues:
+        return
+
+    lanes: List[Tuple[int, Dict[str, Any]]] = []  # (end of the lane's last caption, track)
+    materials = draft["materials"]
+    for start, duration, words in sorted(cues, key=lambda c: c[0]):
+        lane = next((i for i, (lane_end, _) in enumerate(lanes) if lane_end <= start), None)
+        if lane is None:
+            track = {"id": _new_id(), "type": "text", "flag": 0, "attribute": 0, "name": "",
+                     "is_default_name": True, "segments": []}
+            draft["tracks"].append(track)
+            lanes.append((0, track))
+            lane = len(lanes) - 1
+        material = captext.text_material(words)
+        animation = captext.text_animation()
+        materials.setdefault("texts", []).append(material)
+        materials.setdefault("material_animations", []).append(animation)
+        lanes[lane][1]["segments"].append(captext.text_segment(material["id"], animation["id"], start, duration, 0.0))
+        lanes[lane] = (start + duration, lanes[lane][1])
+        draft["duration"] = max(draft["duration"], start + duration)
 
 
 def _with_own_id(draft: Dict[str, Any], doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -854,7 +914,8 @@ def _new_sidecar(draft: Dict[str, Any], draft_dir: Path) -> Dict[str, Any]:
     now = int(time.time() * 1_000_000)
     return {
         "draft_cover": "",
-        "draft_fold_path": str(draft_dir),
+        # CapCut writes this one with forward slashes on every platform.
+        "draft_fold_path": draft_dir.as_posix(),
         "draft_id": draft.get("id", ""),
         "draft_is_ai_shorts": False,
         "draft_is_invisible": False,
