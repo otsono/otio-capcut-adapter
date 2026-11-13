@@ -8,13 +8,21 @@ README.
 """
 
 import json
+import shutil
+import subprocess
 import warnings
 from pathlib import Path
 
 import opentimelineio as otio
 import pytest
 
+from opentimelineio.adapters.file_bundle_utils import NotAFileOnDisk
+
+from otio_capcut_adapter import drafts_dir
 from otio_capcut_adapter.errors import CapCutAdapterError, CapCutWarning
+
+FFMPEG = shutil.which("ffmpeg")
+needs_ffmpeg = pytest.mark.skipif(FFMPEG is None, reason="ffmpeg is not installed")
 
 RATE = 30
 
@@ -60,9 +68,12 @@ def timeline(media):
 
 
 def write(tl, path, **kwargs):
+    # The stand-in media here are not real video, so covers are off unless a test asks.
+    kwargs.setdefault("cover", False)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        otio.adapters.write_to_file(tl, str(path), adapter_name="capcut", **kwargs)
+        result = otio.adapters.write_to_file(tl, str(path), adapter_name="capcut", **kwargs)
+    write.result = result
     return [str(w.message) for w in caught if issubclass(w.category, CapCutWarning)]
 
 
@@ -284,18 +295,200 @@ def test_unsupported_things_warn(tmp_path, media):
     assert any("Blur" in w for w in caught)
 
 
-def test_missing_media_warns(tmp_path, media):
+def missing_media_timeline(tmp_path):
     tl = otio.schema.Timeline(name="missing")
     track = otio.schema.Track(kind=otio.schema.TrackKind.Video)
     track.append(clip("gone", tmp_path / "nope.mp4", 0, 1))
     track.append(otio.schema.Clip(name="no ref", source_range=tr(0, 1)))
     tl.tracks.append(track)
-    caught = write(tl, tmp_path / "m")
-    assert any("Media not found" in w for w in caught)
-    assert any("no local media" in w for w in caught)
+    return tl
+
+
+def test_missing_media_raises_by_default(tmp_path):
+    # The same default as OpenTimelineIO's otiod adapter.
+    with pytest.raises(NotAFileOnDisk):
+        write(missing_media_timeline(tmp_path), tmp_path / "m")
+    assert not (tmp_path / "m").exists()  # nothing written, not even the folder
+
+
+def test_web_media_raises_by_default(tmp_path):
+    tl = otio.schema.Timeline(name="web")
+    track = otio.schema.Track(kind=otio.schema.TrackKind.Video)
+    track.append(otio.schema.Clip(
+        name="web", source_range=tr(0, 1),
+        media_reference=otio.schema.ExternalReference(target_url="https://example.com/a.mp4")))
+    tl.tracks.append(track)
+    with pytest.raises(NotAFileOnDisk, match="local media"):
+        write(tl, tmp_path / "w")
+    caught = write(tl, tmp_path / "w", media_policy="MissingIfNotFile")
+    assert any("not a local file" in w for w in caught)
+
+
+def test_missing_if_not_file_writes_placeholders(tmp_path):
+    caught = write(missing_media_timeline(tmp_path), tmp_path / "m", media_policy="MissingIfNotFile")
+    assert any("media not found" in w for w in caught)
+    assert any("no media reference" in w for w in caught)
     draft = load(tmp_path / "m" / "draft_content.json")
-    assert draft["materials"]["videos"][1]["path"] == ""
+    assert [m["path"] for m in draft["materials"]["videos"]] == ["", ""]
     assert_consistent(draft)
+
+
+def test_all_missing_copies_nothing(tmp_path, media):
+    caught = write(timeline(media), tmp_path / "a", media_policy="AllMissing")
+    assert any("AllMissing" in w for w in caught)
+    draft = load(tmp_path / "a" / "draft_content.json")
+    assert all(m["path"] == "" for m in draft["materials"]["videos"] + draft["materials"]["audios"])
+    assert not (tmp_path / "a" / "assets").exists()
+
+
+def test_unknown_media_policy(tmp_path, media):
+    with pytest.raises(CapCutAdapterError, match="media_policy"):
+        write(timeline(media), tmp_path / "x", media_policy="Whatever")
+
+
+# ─── structure CapCut cannot hold is an error ───────────────────────────────
+
+
+def test_nested_stack_in_a_track_is_not_supported(tmp_path, media):
+    tl = timeline(media)
+    tl.tracks[0].append(otio.schema.Stack(name="nested"))
+    with pytest.raises(otio.exceptions.NotSupportedError, match="nesting"):
+        write(tl, tmp_path / "n")
+    assert not (tmp_path / "n").exists()
+
+
+def test_stack_inside_the_stack_is_not_supported(tmp_path, media):
+    tl = timeline(media)
+    tl.tracks.append(otio.schema.Stack(name="nested"))
+    with pytest.raises(otio.exceptions.NotSupportedError, match="not a track"):
+        write(tl, tmp_path / "n")
+
+
+# ─── dryrun ─────────────────────────────────────────────────────────────────
+
+
+def test_dryrun_writes_nothing_and_reports_bytes(tmp_path, media):
+    caught = write(timeline(media), tmp_path / "d", dryrun=True)
+    # crowd.mp4 once (used twice), dj.mp4, track.mp3
+    assert write.result == len(b"crowd") + len(b"dj") + len(b"music")
+    assert not (tmp_path / "d").exists()
+    assert any("bare skeleton" in w for w in caught)  # still checked
+    write(timeline(media), tmp_path / "d", dryrun=True, copy_media=False)
+    assert write.result == 0
+
+
+def test_dryrun_still_raises(tmp_path):
+    with pytest.raises(NotAFileOnDisk):
+        write(missing_media_timeline(tmp_path), tmp_path / "d", dryrun=True)
+
+
+# ─── the cover ──────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def real_video(tmp_path):
+    """Two seconds of real video whose colour changes each frame, so frames differ."""
+    if FFMPEG is None:
+        pytest.skip("ffmpeg is not installed")
+    path = tmp_path / "real.mp4"
+    subprocess.run([FFMPEG, "-nostdin", "-loglevel", "error", "-y", "-f", "lavfi",
+                    "-i", "testsrc2=size=320x240:rate=30:duration=4", "-pix_fmt", "yuv420p", str(path)],
+                   check=True)
+    return path
+
+
+def video_timeline(path, start=0, duration=4):
+    tl = otio.schema.Timeline(name="cover")
+    track = otio.schema.Track(kind=otio.schema.TrackKind.Video)
+    track.append(clip("real", path, start, duration))
+    tl.tracks.append(track)
+    return tl
+
+
+def jpeg_size(path):
+    out = subprocess.run([shutil.which("ffprobe") or "ffprobe", "-v", "error", "-select_streams", "v:0",
+                          "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+                         check=True, capture_output=True, text=True).stdout.strip()
+    return tuple(int(x) for x in out.split(","))
+
+
+@needs_ffmpeg
+def test_cover_from_an_early_frame(tmp_path, real_video):
+    out = tmp_path / "c"
+    caught = write(video_timeline(real_video), out, cover=None, width=1080, height=1920)
+    assert not any("cover" in w for w in caught)
+    cover = out / "draft_cover.jpg"
+    assert cover.read_bytes()[:2] == b"\xff\xd8"  # a JPEG
+    assert jpeg_size(cover) == (720, 1280)  # the canvas's shape, longest side 1280
+    assert load(out / "draft_meta_info.json")["draft_cover"] == "draft_cover.jpg"
+
+
+@needs_ffmpeg
+def test_cover_seed_repeats_and_differs(tmp_path, real_video):
+    covers = []
+    for i, seed in enumerate((1, 1, 2)):
+        write(video_timeline(real_video), tmp_path / f"s{i}", cover=None, cover_seed=seed)
+        covers.append((tmp_path / f"s{i}" / "draft_cover.jpg").read_bytes())
+    assert covers[0] == covers[1]
+    assert covers[0] != covers[2]
+
+
+def test_cover_pick_is_early_and_follows_the_source(tmp_path, media):
+    from otio_capcut_adapter.adapters.capcut import COVER_WINDOW_S, _pick_cover_frame
+    write(timeline(media), tmp_path / "p")
+    draft = load(tmp_path / "p" / "draft_content.json")
+    for seed in range(50):
+        path, seconds, photo = _pick_cover_frame(draft, seed)
+        # The timeline is 4.75s long, so the window is its first quarter: inside the first shot,
+        # which starts 12s into crowd.mp4.
+        assert path.endswith("crowd.mp4") and not photo
+        assert 12 <= seconds < 12 + min(COVER_WINDOW_S, 4.75 / 4)
+
+
+def test_no_ffmpeg_means_no_cover_and_a_warning(tmp_path, media):
+    out = tmp_path / "f"
+    caught = write(timeline(media), out, cover=None, ffmpeg=str(tmp_path / "no-ffmpeg"))
+    assert any("ffmpeg is not installed" in w for w in caught)
+    assert not (out / "draft_cover.jpg").exists()
+    assert load(out / "draft_meta_info.json")["draft_cover"] == ""
+
+
+def test_cover_false_and_given_cover(tmp_path, media):
+    write(timeline(media), tmp_path / "none", cover=False)
+    assert not (tmp_path / "none" / "draft_cover.jpg").exists()
+    image = tmp_path / "mine.jpg"
+    image.write_bytes(b"\xff\xd8 not really decoded without ffmpeg")
+    write(timeline(media), tmp_path / "given", cover=str(image), ffmpeg=str(tmp_path / "no-ffmpeg"))
+    assert (tmp_path / "given" / "draft_cover.jpg").read_bytes() == image.read_bytes()
+    with pytest.raises(CapCutAdapterError, match="cover"):
+        write(timeline(media), tmp_path / "bad", cover=str(tmp_path / "nope.jpg"))
+
+
+@needs_ffmpeg
+def test_cover_in_a_filled_project_keeps_a_backup(tmp_path, real_video):
+    project = make_app_project(tmp_path / "store" / "App project", nested=False)
+    (project / "draft_cover.jpg").write_bytes(b"old cover")
+    write(video_timeline(real_video), project, cover=None)
+    assert (project / "draft_cover.jpg.bak").read_bytes() == b"old cover"
+    assert (project / "draft_cover.jpg").read_bytes()[:2] == b"\xff\xd8"
+
+
+# ─── where CapCut keeps drafts ──────────────────────────────────────────────
+
+
+def test_drafts_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData"))
+    mac = drafts_dir(must_exist=False, platform="darwin")
+    assert mac == tmp_path / "Movies" / "CapCut" / "User Data" / "Projects" / "com.lveditor.draft"
+    win = drafts_dir(must_exist=False, platform="win32")
+    assert win == tmp_path / "AppData" / "CapCut" / "User Data" / "Projects" / "com.lveditor.draft"
+    with pytest.raises(CapCutAdapterError, match="Open CapCut once"):
+        drafts_dir(platform="darwin")
+    mac.mkdir(parents=True)
+    assert drafts_dir(platform="darwin") == mac
+    with pytest.raises(CapCutAdapterError, match="macOS and Windows"):
+        drafts_dir(platform="linux")
 
 
 def test_file_urls(tmp_path, media):

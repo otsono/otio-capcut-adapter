@@ -15,7 +15,10 @@ otio.adapters.write_to_file(
 ```
 
 > **Status: v0.1, not yet tested in the CapCut app.** The output is checked by automated tests
-> only. CapCut publishes no project format and changes it between versions; see
+> only.
+>
+> **The CapCut format is reverse-engineered.** CapCut publishes no project format and changes it
+> between versions without notice, so a CapCut update can break this adapter. See
 > [Tested CapCut versions](#tested-capcut-versions).
 
 ## Install
@@ -25,6 +28,9 @@ pip install otio-capcut-adapter
 ```
 
 OpenTimelineIO finds the adapter on its own once installed. It is named `capcut`.
+
+For the generated cover, install [ffmpeg](https://ffmpeg.org) too. Everything else works without
+it.
 
 ## Writing a draft
 
@@ -42,6 +48,15 @@ project:
    - Mac: `~/Movies/CapCut/User Data/Projects/com.lveditor.draft/<project>`
    - Windows: `%LOCALAPPDATA%\CapCut\User Data\Projects\com.lveditor.draft\<project>`
 3. Write the timeline into that folder (the example above), then open CapCut.
+
+`drafts_dir()` finds that folder for you, and says so plainly when CapCut has never been opened on
+the computer:
+
+```python
+from otio_capcut_adapter import drafts_dir
+
+otio.adapters.write_to_file(timeline, drafts_dir() / "My project", adapter_name="capcut")
+```
 
 The adapter keeps the project's id, name, version markers and canvas, and writes the cut into every
 plain-JSON timeline file the project has, including the `Timelines/<id>/` document newer builds read
@@ -62,6 +77,11 @@ never the content, of a real project, in this order:
 
 | Option | Default | What it does |
 | --- | --- | --- |
+| `media_policy` | `"ErrorIfNotFile"` | As in OpenTimelineIO's own `otiod` adapter. `ErrorIfNotFile` raises `NotAFileOnDisk` for media that is not a local file. `MissingIfNotFile` writes such clips as placeholders CapCut asks you to relink. `AllMissing` writes every clip as a placeholder and copies no media. |
+| `cover` | `None` | The tile in CapCut's project list. `None`: a random frame from early in the main track (the first 3 seconds, or the first quarter if the cut is shorter), cropped to the canvas. A path: that image. `False`: no cover. |
+| `cover_seed` | none | Seed for the random pick, for the same cover every time. |
+| `ffmpeg` | the one on `PATH` | ffmpeg, for the cover. Without it there is no generated cover and you get a warning; the draft is still written. |
+| `dryrun` | `False` | Check everything and write nothing. Returns the bytes of media that would be copied, as `otiod` does. |
 | `copy_media` | `True` | Copies media into the draft's `assets/` folder. On a Mac, CapCut cannot always read files under Desktop, Documents or Downloads, and a draft that carries its media can be moved. |
 | `width`, `height` | the project's own, else 1920 × 1080 | Canvas size in pixels. OTIO has no standard field for it. |
 | `template` | none | A CapCut project folder to seed a new draft from. |
@@ -78,14 +98,17 @@ never the content, of a real project, in this order:
 | Gap | Space before the next segment | CapCut closes gaps on the **main** track when it opens a draft; you get a warning |
 | `LinearTimeWarp` | Segment speed | The clip keeps its length on the track; `time_scalar` sets how much media plays in it |
 | `metadata["capcut"]["volume"]` | Segment volume | OTIO has no standard volume field |
+| Nested stack, other track kinds | Not supported | Raises `NotSupportedError`; flatten the timeline first |
 | `ExternalReference` | Media path | `file://` URLs and plain paths; a missing file becomes a relink prompt in CapCut |
 | `available_range` | Material length | Without it, a material is as long as the cut uses |
 
-Not yet carried, each reported as a `CapCutWarning` rather than dropped silently: markers and
-captions, transitions, nested stacks, and effects other than `LinearTimeWarp`. There is no reading
-of CapCut drafts yet.
+Not yet carried, and never dropped silently. As in OpenTimelineIO's other adapters, what CapCut
+cannot hold at all raises `otio.exceptions.NotSupportedError`: a nested stack, or a track that is
+not Video or Audio. Smaller losses are a `CapCutWarning` and the draft is still written: markers
+and captions, transitions (written as cuts), and effects other than `LinearTimeWarp`. There is no
+reading of CapCut drafts yet.
 
-To see the warnings:
+To see the warnings, or turn them into errors with `warnings.simplefilter("error", CapCutWarning)`:
 
 ```python
 import warnings

@@ -21,8 +21,11 @@ ways this adapter writes, safest first:
 3. **A bare skeleton**, when neither is available. Current builds may refuse
    it; a warning says so.
 
-What is written, and what is not (everything not written is a warning,
-never silent):
+What is written, and what is not. Nothing is dropped silently: a loss
+that changes the structure of the edit (a nested stack, a track kind CapCut
+has no place for) raises ``NotSupportedError``, as OpenTimelineIO's other
+adapters do; a smaller loss (a marker, a transition written as a cut) is a
+``CapCutWarning``.
 
 - Video and audio tracks, in order. The first video track is CapCut's main
   track, which CapCut makes gapless when it opens the draft, so gaps there
@@ -32,6 +35,9 @@ never silent):
   ``source_range.duration`` on its track, and a time warp changes how much
   media plays in that time (``duration x time_scalar``).
 - Clip volume from ``metadata["capcut"]["volume"]`` when present.
+- Media follows ``media_policy``, with the same names and the same strict
+  default as OpenTimelineIO's own ``otiod`` bundle adapter.
+- A cover for CapCut's project list, from a random early frame (ffmpeg).
 - Not yet: markers / captions, transitions, nested stacks, other effects.
 
 Times in a CapCut draft are integer MICROSECONDS throughout.
@@ -43,15 +49,19 @@ import copy
 import hashlib
 import json
 import os
+import random
 import shutil
+import subprocess
 import time
 import uuid
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 import opentimelineio as otio
+from opentimelineio import url_utils
+from opentimelineio.adapters.file_bundle_utils import MediaReferencePolicy, NotAFileOnDisk
 
 from otio_capcut_adapter.errors import CapCutAdapterError, CapCutWarning
 
@@ -72,6 +82,12 @@ IMPORTED_MEDIA_GROUP = 0
 META_GROUP_TYPES = (0, 1, 2, 3, 6, 7, 8)
 
 PHOTO_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "heic"}
+
+#: The cover is drawn from a random moment in the first COVER_WINDOW_S
+#: seconds of the main track, or its first quarter if that is shorter.
+COVER_WINDOW_S = 3.0
+COVER_MAX_SIDE = 1280
+COVER_FILE = "draft_cover.jpg"
 
 #: Stacking order CapCut writes for each kind of segment.
 RENDER_INDEX = {"video": 14000, "audio": 11000}
@@ -134,7 +150,12 @@ def write_to_file(
     height: Optional[int] = None,
     overwrite: bool = False,
     name: Optional[str] = None,
-) -> None:
+    media_policy: str = MediaReferencePolicy.ErrorIfNotFile,
+    dryrun: bool = False,
+    cover: Any = None,
+    cover_seed: Optional[int] = None,
+    ffmpeg: Optional[str] = None,
+) -> Optional[int]:
     """Write ``input_otio`` as the CapCut draft folder ``filepath``.
 
     ``filepath`` an existing CapCut project folder
@@ -143,10 +164,28 @@ def write_to_file(
     ``filepath`` a new folder
         Create a draft there, seeded from ``template`` (a real CapCut project
         folder) or from the newest app-made project beside it.
+    ``media_policy``
+        As in OpenTimelineIO's ``otiod`` adapter (``MediaReferencePolicy``):
+        ``ErrorIfNotFile`` (default) raises ``NotAFileOnDisk`` for media that
+        is not a local file; ``MissingIfNotFile`` writes such clips as
+        placeholders CapCut asks you to relink; ``AllMissing`` writes every
+        clip as a placeholder and copies no media.
     ``copy_media``
         Copy media into the draft's ``assets/`` folder (default). CapCut on
         macOS cannot always read files under Desktop, Documents or Downloads,
         and a draft that carries its media survives being moved.
+    ``cover``
+        The tile CapCut shows in its project list. ``None`` (default): a
+        random frame from early in the main track, drawn with ffmpeg.
+        A path: that image. ``False``: no cover.
+    ``cover_seed``
+        Seed for the random pick, for the same cover every time.
+    ``ffmpeg``
+        Path to ffmpeg. Default: the one on ``PATH``. Without one there is no
+        generated cover, and a warning says so.
+    ``dryrun``
+        Check everything and write nothing. Returns the bytes of media that
+        would be copied, as ``otiod`` does.
     ``width`` / ``height``
         Canvas size. Default: the project's own, else 1920x1080.
     ``name``
@@ -155,6 +194,15 @@ def write_to_file(
     """
     if not isinstance(input_otio, otio.schema.Timeline):
         raise CapCutAdapterError("The CapCut adapter writes a Timeline.")
+    policies = (MediaReferencePolicy.ErrorIfNotFile, MediaReferencePolicy.MissingIfNotFile,
+                MediaReferencePolicy.AllMissing)
+    if media_policy not in policies:
+        raise CapCutAdapterError(f"media_policy must be one of {', '.join(policies)}; got {media_policy!r}.")
+    cover_file: Optional[Path] = None
+    if cover is not None and cover is not False:
+        cover_file = Path(cover).expanduser()
+        if not cover_file.is_file():
+            raise CapCutAdapterError(f"cover {cover} is not a file.")
 
     draft_dir = Path(filepath).expanduser().resolve()
     existing = _find_timeline_files(draft_dir) if draft_dir.is_dir() else {}
@@ -189,9 +237,13 @@ def write_to_file(
     canvas = _canvas(skeleton, width, height)
     skeleton["canvas_config"] = canvas
 
-    draft_dir.mkdir(parents=True, exist_ok=True)
+    if media_policy == MediaReferencePolicy.AllMissing:
+        _warn("media_policy is AllMissing: every clip is a placeholder for CapCut to relink.")
     media = _MediaStager(draft_dir, copy_media)
-    draft = _build(input_otio, skeleton, canvas, media)
+    draft = _build(input_otio, skeleton, canvas, media, media_policy)
+
+    if dryrun:
+        return media.total_bytes()
 
     sidecar_path = draft_dir / "draft_meta_info.json"
     sidecar = _read_json(sidecar_path) if sidecar_path.exists() else None
@@ -219,13 +271,26 @@ def write_to_file(
     else:
         writes.append((draft_dir / "draft_content.json", draft))
         writes.append((draft_dir / "draft_info.json", draft))
+
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    media.commit()
+
+    # A cover is never worth failing the export over: any problem is a warning.
+    if cover is not False:
+        made = _write_cover(draft, draft_dir, canvas, cover_file, cover_seed, ffmpeg, backup=(mode == "fill"))
+        if made:
+            sidecar["draft_cover"] = COVER_FILE
+        elif mode == "new":
+            sidecar["draft_cover"] = ""
+    elif mode == "new":
+        sidecar["draft_cover"] = ""
     writes.append((sidecar_path, sidecar))
 
-    media.commit()
     for path, doc in writes:
         if mode == "fill" and path.exists():
             shutil.copy2(path, path.with_name(path.name + ".bak"))
         _write_json(path, doc)
+    return None
 
 
 # ─── reading a project ──────────────────────────────────────────────────────
@@ -384,15 +449,11 @@ class _MediaStager:
         self._taken: Dict[str, str] = {}
 
     def place(self, source: Optional[str], kind: str) -> str:
-        """The path the draft should name for ``source``; "" when there is none."""
+        """The path the draft should name for ``source``, a file known to exist; "" for none."""
         if not source:
             return ""
-        src = Path(source).expanduser()
-        if src.is_file():
-            src = src.resolve()
-        if not self.copy_media or not src.is_file():
-            if not src.is_file():
-                _warn(f"Media not found: {source}. CapCut will ask to relink it.")
+        src = Path(source).resolve()
+        if not self.copy_media:
             return str(src)
         key = (kind, str(src.resolve()))
         if key in self._planned:
@@ -410,6 +471,10 @@ class _MediaStager:
         self._planned[key] = candidate
         return str(candidate)
 
+    def total_bytes(self) -> int:
+        """Bytes of media this draft would copy: each file once."""
+        return sum(Path(src).stat().st_size for src in {src for (_, src) in self._planned})
+
     def commit(self) -> None:
         for (_, src), dest in self._planned.items():
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -426,21 +491,45 @@ def _file_digest(path: Path) -> str:
     return h.hexdigest()
 
 
-def _media_path(clip: otio.schema.Clip) -> Optional[str]:
+def _resolve_media(clip: otio.schema.Clip, policy: str, where: str) -> Optional[str]:
+    """The clip's media as an absolute path to a file, or None for a placeholder.
+
+    Follows ``otiod``: under ``ErrorIfNotFile`` media that is not a local
+    file raises ``NotAFileOnDisk``; under ``MissingIfNotFile`` it becomes a
+    placeholder. Plain paths, relative ones included (to the working
+    directory), are paths, Windows drive paths too; ``file:`` URLs go through
+    OpenTimelineIO's own ``url_utils``.
+    """
+    if policy == MediaReferencePolicy.AllMissing:
+        return None
     ref = clip.media_reference
-    if not isinstance(ref, otio.schema.ExternalReference) or not ref.target_url:
+    target = getattr(ref, "target_url", None) if isinstance(ref, otio.schema.ExternalReference) else None
+    if not target:
+        # otiod passes these through untouched; CapCut needs something, so a placeholder.
+        _warn(f"{where}: no media reference, so CapCut will show a missing-media placeholder.")
         return None
-    url = ref.target_url
-    parsed = urlparse(url)
-    if parsed.scheme == "file":
-        path = unquote(parsed.path)
-        # file:///C:/x → /C:/x on Windows-style URLs
-        if len(path) > 2 and path[0] == "/" and path[2] == ":":
-            path = path[1:]
-        return path
-    if parsed.scheme in ("http", "https"):
+
+    scheme = urlparse(target).scheme
+    if scheme == "file":
+        path = url_utils.filepath_from_url(target)
+    elif scheme == "" or (len(scheme) == 1 and scheme.isalpha()):  # "C:\\..." parses as scheme "c"
+        path = target
+    else:
+        if policy == MediaReferencePolicy.ErrorIfNotFile:
+            raise NotAFileOnDisk(
+                f"{where}: the CapCut adapter only works with local media; got '{target}'. "
+                "Pass media_policy='MissingIfNotFile' to write it as a placeholder instead."
+            )
+        _warn(f"{where}: '{target}' is not a local file, so CapCut will ask to relink it.")
         return None
-    return url
+
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        if policy == MediaReferencePolicy.ErrorIfNotFile:
+            raise NotAFileOnDisk(path)
+        _warn(f"{where}: media not found at {path}, so CapCut will ask to relink it.")
+        return None
+    return path
 
 
 # ─── building the draft ─────────────────────────────────────────────────────
@@ -544,7 +633,7 @@ def _speed_of(clip: otio.schema.Clip, where: str) -> float:
 
 
 def _build(
-    tl: otio.schema.Timeline, skeleton: Dict[str, Any], canvas: Dict[str, Any], media: _MediaStager
+    tl: otio.schema.Timeline, skeleton: Dict[str, Any], canvas: Dict[str, Any], media: _MediaStager, policy: str
 ) -> Dict[str, Any]:
     draft = skeleton
     materials = draft["materials"]
@@ -553,15 +642,18 @@ def _build(
 
     for t_index, track in enumerate(tl.tracks):
         if not isinstance(track, otio.schema.Track):
-            _warn(f"Item {t_index} of the timeline's stack is not a track and was left out.")
-            continue
+            raise otio.exceptions.NotSupportedError(
+                f"Item {t_index} of the timeline's stack is a {type(track).__name__}, not a track. "
+                "CapCut has no nesting; flatten the timeline first."
+            )
         if track.kind == otio.schema.TrackKind.Video:
             kind = "video"
         elif track.kind == otio.schema.TrackKind.Audio:
             kind = "audio"
         else:
-            _warn(f"Track {track.name or t_index} is of kind {track.kind!r}, which CapCut has no place for; left out.")
-            continue
+            raise otio.exceptions.NotSupportedError(
+                f"Track {track.name or t_index} is of kind {track.kind!r}; CapCut takes Video and Audio tracks."
+            )
         if track.markers:
             _warn(f"Track {track.name or t_index}: {len(track.markers)} marker(s) are not carried yet.")
 
@@ -588,9 +680,10 @@ def _build(
                 _warn(f"{where}: transitions are not carried yet; written as a cut.")
                 continue
             if not isinstance(item, otio.schema.Clip):
-                _warn(f"{where}: {type(item).__name__} is not supported yet and was left out.")
-                cursor = start + duration
-                continue
+                raise otio.exceptions.NotSupportedError(
+                    f"{where}: a {type(item).__name__} inside a track. CapCut has no nesting; "
+                    "flatten the timeline first."
+                )
             if not item.enabled:
                 _warn(f"{where}: disabled clip left out.")
                 cursor = start + duration
@@ -608,9 +701,7 @@ def _build(
             # A material is as long as its file; without that fact, as long as this edit needs.
             mat_duration = _us(avail.start_time + avail.duration) if avail else source_start + consumed
 
-            raw_path = _media_path(item)
-            if raw_path is None:
-                _warn(f"{where}: no local media file; CapCut will show a missing-media placeholder.")
+            raw_path = _resolve_media(item, policy, where)
             path = media.place(raw_path, kind)
             name = Path(raw_path).name if raw_path else (item.name or "missing")
 
@@ -658,13 +749,111 @@ def _with_own_id(draft: Dict[str, Any], doc: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+# ─── the cover ──────────────────────────────────────────────────────────────
+
+
+def _pick_cover_frame(draft: Dict[str, Any], seed: Optional[int]) -> Optional[Tuple[str, float, bool]]:
+    """A random early moment on the main track: (file, seconds into it, is a photo).
+
+    Early, because the opening is what a project is recognised by; random
+    within that, because the very first frame is often black or a fade.
+    """
+    main = next((t for t in draft["tracks"] if t["type"] == "video" and t["segments"]), None)
+    if main is None:
+        return None
+    by_id = {m["id"]: m for m in draft["materials"]["videos"]}
+    segments = [s for s in main["segments"] if by_id.get(s["material_id"], {}).get("path")]
+    if not segments:
+        return None
+    end = max(s["target_timerange"]["start"] + s["target_timerange"]["duration"] for s in segments)
+    window = min(COVER_WINDOW_S * 1_000_000, end / 4) or 1
+    t = random.Random(seed).uniform(0, window)
+    # The segment playing at t, or the next one if t falls in a gap.
+    seg = next(
+        (s for s in segments if s["target_timerange"]["start"] + s["target_timerange"]["duration"] > t),
+        segments[-1],
+    )
+    offset = max(0.0, t - seg["target_timerange"]["start"])
+    source_us = seg["source_timerange"]["start"] + offset * seg["speed"]
+    mat = by_id[seg["material_id"]]
+    return mat["path"], source_us / 1_000_000, mat.get("type") == "photo"
+
+
+def _cover_size(canvas: Dict[str, Any]) -> Tuple[int, int]:
+    w, h = canvas["width"], canvas["height"]
+    scale = min(1.0, COVER_MAX_SIDE / max(w, h))
+    return max(2, int(w * scale) // 2 * 2), max(2, int(h * scale) // 2 * 2)
+
+
+def _write_cover(
+    draft: Dict[str, Any], draft_dir: Path, canvas: Dict[str, Any], given: Optional[Path],
+    seed: Optional[int], ffmpeg: Optional[str], backup: bool,
+) -> bool:
+    """Write ``draft_cover.jpg``. Returns whether it was written; problems are warnings."""
+    dest = draft_dir / COVER_FILE
+    exe = ffmpeg or shutil.which("ffmpeg")
+    if ffmpeg and not (Path(ffmpeg).is_file() or shutil.which(ffmpeg)):
+        exe = None
+    w, h = _cover_size(canvas)
+    frame = ["-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}", "-frames:v", "1"]
+
+    if given is not None:
+        if exe is None and given.suffix.lower() not in (".jpg", ".jpeg"):
+            _warn(f"No ffmpeg to turn {given.name} into a JPEG, so the draft has no cover.")
+            return False
+        if exe is None:
+            _replace(dest, lambda tmp: shutil.copyfile(given, tmp), backup)
+            return True
+        args = ["-i", str(given)]
+    else:
+        pick = _pick_cover_frame(draft, seed)
+        if pick is None:
+            _warn("No video on the main track to take a cover from, so the draft has none.")
+            return False
+        if exe is None:
+            _warn("ffmpeg is not installed, so the draft has no cover; CapCut shows a blank tile until one is set.")
+            return False
+        path, seconds, photo = pick
+        args = ["-i", path] if photo else ["-ss", f"{seconds:.3f}", "-i", path]
+
+    def run(tmp: Path) -> None:
+        subprocess.run(
+            [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", *args, *frame, "-q:v", "3", str(tmp)],
+            check=True, capture_output=True, timeout=60,
+        )
+        if not tmp.is_file() or tmp.stat().st_size == 0:
+            raise RuntimeError("ffmpeg wrote no image")
+
+    try:
+        _replace(dest, run, backup)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as e:
+        detail = getattr(e, "stderr", b"") or b""
+        reason = detail.decode("utf-8", "replace").strip().splitlines()[-1:] or [str(e)]
+        _warn(f"Could not make a cover ({reason[0]}), so the draft has none.")
+        return False
+    return True
+
+
+def _replace(dest: Path, make, backup: bool) -> None:
+    """Make a file next to ``dest``, then swap it in, keeping a .bak of what was there."""
+    tmp = dest.with_name(f".{dest.stem}.tmp-{os.getpid()}{dest.suffix}")
+    try:
+        make(tmp)
+        if backup and dest.exists():
+            shutil.copy2(dest, dest.with_name(dest.name + ".bak"))
+        os.replace(tmp, dest)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 # ─── the sidecar ────────────────────────────────────────────────────────────
 
 
 def _new_sidecar(draft: Dict[str, Any], draft_dir: Path) -> Dict[str, Any]:
     now = int(time.time() * 1_000_000)
     return {
-        "draft_cover": "draft_cover.jpg",
+        "draft_cover": "",
         "draft_fold_path": str(draft_dir),
         "draft_id": draft.get("id", ""),
         "draft_is_ai_shorts": False,

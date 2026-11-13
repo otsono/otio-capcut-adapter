@@ -25,6 +25,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      # ffmpeg makes the covers; on Linux only, so the cover tests run once per Python without
+      # slowing every job. Elsewhere those tests skip themselves.
+      - name: Install ffmpeg
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install
         shell: bash
         run: |
