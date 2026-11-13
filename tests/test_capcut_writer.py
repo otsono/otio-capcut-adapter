@@ -477,7 +477,8 @@ def test_cover_in_a_filled_project_keeps_a_backup(tmp_path, real_video):
 
 
 def test_drafts_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    # Patch Path.home itself: Windows reads USERPROFILE, not HOME, so setting HOME is not enough there.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData"))
     mac = drafts_dir(must_exist=False, platform="darwin")
     assert mac == tmp_path / "Movies" / "CapCut" / "User Data" / "Projects" / "com.lveditor.draft"
