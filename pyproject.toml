@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "otio-capcut-adapter"
+dynamic = ["version"]
+description = "OpenTimelineIO adapter that writes CapCut drafts"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["OpenTimelineIO>=0.17.0"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Video :: Non-Linear Editor",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Operating System :: OS Independent",
+]
+keywords = ["otio", "otio-adapter", "opentimelineio", "capcut", "editing", "non-linear"]
+
+[project.urls]
+Homepage = "https://github.com/otsono/otio-capcut-adapter"
+"Bug Tracker" = "https://github.com/otsono/otio-capcut-adapter/issues"
+
+[project.entry-points."opentimelineio.plugins"]
+otio_capcut_adapter = "otio_capcut_adapter"
+
+[project.optional-dependencies]
+dev = ["pytest", "flake8"]
+
+[tool.hatch.version]
+path = "src/otio_capcut_adapter/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+exclude = [".github"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
